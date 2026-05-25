@@ -39,6 +39,26 @@ import {
 } from "./arkiv";
 import { ExpirationTime, jsonToPayload } from "@arkiv-network/sdk/utils";
 
+const queryAgentInference = async (
+  agentId: string,
+  context: string,
+  action: string
+): Promise<string | null> => {
+  try {
+    const res = await fetch("/api/inference", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId, context, action })
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.ok) return data.answer;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
 interface GameState {
   // Game states
   gameId: string | null;
@@ -52,7 +72,7 @@ interface GameState {
   envelope: Envelope | null;
 
   // On-Chain Cryptographic proof fields
-  encryptedEnvelope: string | null; // Cryptographically committed envelope ciphertext
+  encryptedEnvelope: string | null;
 
   // Private cryptographic states (kept locally)
   privateKeys: Record<SuspectId, any>; // Private keys for decrypting clues
@@ -69,6 +89,8 @@ interface GameState {
 
   // Technical Arkiv state
   ledger: ArkivTx[];
+  transactionError: string | null; // Pauses loop if on-chain write fails (gas shortage)
+  activeMonologue: string | null;
 
   // Actions
   setWritePrivateKey: (key: string) => void;
@@ -79,6 +101,7 @@ interface GameState {
   resetGame: () => void;
   initializeGame: () => Promise<void>;
   executeSingleStep: () => Promise<void>;
+  clearTransactionError: () => void;
 }
 
 export const useGameStore = create<GameState>((set, get) => {
@@ -107,15 +130,21 @@ export const useGameStore = create<GameState>((set, get) => {
     notebookRevealCount: {},
     writePrivateKey: typeof window !== "undefined" ? getOrGeneratePrivateKey() : DEFAULT_DEMO_PRIVATE_KEY,
     isPlaying: false,
-    gameSpeed: 1600, // standard delay between actions
+    gameSpeed: 2000, // Standard spectator step delay
     activeAction: "idle",
     selectedSuggestion: null,
     disproveResult: null,
     ledger: [],
+    transactionError: null,
+    activeMonologue: null,
 
     setWritePrivateKey: (writePrivateKey) => set({ writePrivateKey }),
     setGameSpeed: (gameSpeed) => set({ gameSpeed }),
-    togglePlay: () => set((state) => ({ isPlaying: !state.isPlaying })),
+    togglePlay: () => set((state) => ({ 
+      isPlaying: !state.isPlaying,
+      transactionError: null // Clear gas error on play retry
+    })),
+    clearTransactionError: () => set({ transactionError: null }),
 
     addLedgerTx: (tx) => {
       const id = Math.random().toString(36).substring(7);
@@ -155,12 +184,14 @@ export const useGameStore = create<GameState>((set, get) => {
         activeAction: "idle",
         selectedSuggestion: null,
         disproveResult: null,
+        transactionError: null,
+        activeMonologue: null,
       });
     },
 
     initializeGame: async () => {
       const { writePrivateKey, addLedgerTx, updateLedgerTxStatus } = get();
-      set({ activeAction: "idle", status: "setup" });
+      set({ activeAction: "idle", status: "setup", transactionError: null });
 
       const generatedGameId = `game-${Math.random().toString(36).substring(2, 10)}`;
 
@@ -258,7 +289,7 @@ export const useGameStore = create<GameState>((set, get) => {
         turn: 0,
         player: "CIPHER",
         type: "setup",
-        text: `Game initialized at Aether Manor. 3 secret files locked in The Mainframe. Envelope cryptographically committed on Braga.`,
+        text: `Game initialized at Aether Manor. Envelope committed on Braga. Remaining cards distributed to AI detectives.`,
         timestamp: Date.now(),
       };
 
@@ -278,10 +309,10 @@ export const useGameStore = create<GameState>((set, get) => {
         disproveResult: null,
         selectedSuggestion: null,
         activeAction: "next_turn_pending",
+        activeMonologue: null,
       });
 
-      // 4. Background Arkiv Braga syncing (Asynchronous & Safe)
-      // Save Game Session Entity
+      // 4. Arkiv Braga Session Creation
       const gsTxLedgerId = addLedgerTx({
         type: "create",
         entityType: "game_session",
@@ -289,39 +320,48 @@ export const useGameStore = create<GameState>((set, get) => {
         details: `Deploying Game Session ${generatedGameId} to Arkiv Braga`,
       });
 
-      const walletClient = getWalletClient(writePrivateKey);
-      
-      const sessionPayload = {
-        gameId: generatedGameId,
-        status: "playing",
-        currentTurn: 1,
-        activePlayerIndex: 0,
-        players: players.map((p) => ({
-          id: p.id,
-          publicKey: p.publicKey,
-          position: p.position,
-        })),
-        encryptedEnvelope: encryptedEnvelope,
-      };
+      try {
+        const walletClient = getWalletClient(writePrivateKey);
+        const sessionPayload = {
+          gameId: generatedGameId,
+          status: "playing",
+          currentTurn: 1,
+          activePlayerIndex: 0,
+          players: players.map((p) => ({
+            id: p.id,
+            publicKey: p.publicKey,
+            position: p.position,
+          })),
+          encryptedEnvelope: encryptedEnvelope,
+        };
 
-      // Direct Arkiv writes (Simulation toggles are removed, strict testnet)
-      safeArkivWrite(
-        async () => {
-          return await walletClient.createEntity({
-            payload: jsonToPayload(sessionPayload),
-            contentType: "application/json",
-            attributes: [
-              PROJECT_ATTRIBUTE,
-              { key: "entityType", value: "game_session" },
-              { key: "gameId", value: generatedGameId },
-              { key: "status", value: "playing" },
-              { key: "created", value: Date.now() },
-            ],
-            expiresIn: ExpirationTime.fromHours(4),
-          });
-        },
-        (tx) => updateLedgerTxStatus(gsTxLedgerId, tx.status, { txHash: tx.txHash, error: tx.error })
-      ).catch(() => {});
+        // Await strict on-chain write
+        await safeArkivWrite(
+          async () => {
+            return await walletClient.createEntity({
+              payload: jsonToPayload(sessionPayload),
+              contentType: "application/json",
+              attributes: [
+                PROJECT_ATTRIBUTE,
+                { key: "entityType", value: "game_session" },
+                { key: "gameId", value: generatedGameId },
+                { key: "status", value: "playing" },
+                { key: "created", value: Date.now() },
+              ],
+              expiresIn: ExpirationTime.fromHours(4),
+            });
+          },
+          (tx) => updateLedgerTxStatus(gsTxLedgerId, tx.status, { txHash: tx.txHash, error: tx.error })
+        );
+      } catch (err: any) {
+        // Halt match execution on gas write failures!
+        set({ 
+          isPlaying: false, 
+          activeAction: "idle", 
+          transactionError: err?.message || String(err) 
+        });
+        return;
+      }
 
       // Save Encrypted Private Cards for each agent on Arkiv
       for (const p of players) {
@@ -329,10 +369,9 @@ export const useGameStore = create<GameState>((set, get) => {
           type: "create",
           entityType: "clue_entity",
           status: "pending",
-          details: `Publishing high-entropy encrypted private hand for player ${p.name}`,
+          details: `Publishing encrypted private hand for player ${p.name}`,
         });
 
-        // Structure private cards inside a high-entropy JSON package
         const randomCardNonce = Math.random().toString(36).substring(2, 15);
         const cardsPayload = JSON.stringify({
           card: JSON.stringify(p.cards),
@@ -341,24 +380,36 @@ export const useGameStore = create<GameState>((set, get) => {
           nonce: randomCardNonce,
         });
 
-        const encryptedHand = await encryptData(cardsPayload, p.publicKey);
+        try {
+          const encryptedHand = await encryptData(cardsPayload, p.publicKey);
+          const walletClient = getWalletClient(writePrivateKey);
 
-        safeArkivWrite(
-          async () => {
-            return await walletClient.createEntity({
-              payload: jsonToPayload({ encryptedCards: encryptedHand }),
-              contentType: "application/json",
-              attributes: [
-                PROJECT_ATTRIBUTE,
-                { key: "entityType", value: "clue_entity" },
-                { key: "gameId", value: generatedGameId },
-                { key: "ownerAgentId", value: p.id },
-              ],
-              expiresIn: ExpirationTime.fromHours(4),
-            });
-          },
-          (tx) => updateLedgerTxStatus(cardsTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-        ).catch(() => {});
+          // Await strict on-chain write
+          await safeArkivWrite(
+            async () => {
+              return await walletClient.createEntity({
+                payload: jsonToPayload({ encryptedCards: encryptedHand }),
+                contentType: "application/json",
+                attributes: [
+                  PROJECT_ATTRIBUTE,
+                  { key: "entityType", value: "clue_entity" },
+                  { key: "gameId", value: generatedGameId },
+                  { key: "ownerAgentId", value: p.id },
+                ],
+                expiresIn: ExpirationTime.fromHours(4),
+              });
+            },
+            (tx) => updateLedgerTxStatus(cardsTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+          );
+        } catch (err: any) {
+          // Halt match execution on gas write failures!
+          set({ 
+            isPlaying: false, 
+            activeAction: "idle", 
+            transactionError: err?.message || String(err) 
+          });
+          return;
+        }
       }
     },
 
@@ -382,7 +433,7 @@ export const useGameStore = create<GameState>((set, get) => {
 
       const activePlayer = players[activePlayerIndex];
 
-      // If active player is eliminated, skip their turn
+      // If active player is eliminated, skip their turn cleanly
       if (activePlayer.eliminated) {
         set({
           activePlayerIndex: (activePlayerIndex + 1) % players.length,
@@ -396,6 +447,29 @@ export const useGameStore = create<GameState>((set, get) => {
 
       // STATE MACHINE STEP ENGINE
       if (activeAction === "next_turn_pending" || activeAction === "idle") {
+        // Clear any previous transaction errors before attempting next step
+        set({ transactionError: null });
+
+        // Generate dynamic AI monologue on turn start
+        const agentId = activePlayer.id;
+        const currentPos = `x=${activePlayer.position.x}, y=${activePlayer.position.y}`;
+        const notebook = notebooks[agentId];
+        const ruledOutSus = Object.entries(notebook.suspects).filter(([_, s]) => s === "ELIMINATED").map(([id]) => id).join(", ") || "none";
+        const ruledOutWep = Object.entries(notebook.weapons).filter(([_, w]) => w === "ELIMINATED").map(([id]) => id).join(", ") || "none";
+        const hand = activePlayer.cards.map(c => c.name).join(", ");
+        
+        const context = `Your name is ${activePlayer.name}. You hold these private cards in your hand: [${hand}]. You are currently at coordinates ${currentPos}. In your deduction notebook, you have successfully ruled out suspects [${ruledOutSus}] and weapons [${ruledOutWep}]. You are rolling the die now.`;
+        
+        queryAgentInference(agentId, context, "TURN_START").then((text) => {
+          const fallback = {
+            CIPHER: "[LOGIC SECURE] Calibrating pathfinding algorithm... Archive indices optimized.",
+            VECTOR: "[ACCELERATION LOCKED] Compiling BFS hallway coordinates... Executing grid step hops.",
+            SYLPH: "[SIGINT ACTIVE] Sniffing packet traffic on local nodes... Detecting data leaks.",
+            ORACLE: "[PROBABILITY ALIGNED] Formulating vector weights... Converging on solution space."
+          }[agentId] || "";
+          set({ activeMonologue: text || fallback });
+        });
+
         // --- STEP 1: ROLL DICE ---
         set({ activeAction: "rolling" });
         const diceVal = Math.floor(Math.random() * 6) + 1;
@@ -414,8 +488,7 @@ export const useGameStore = create<GameState>((set, get) => {
           logs: [newLog, ...get().logs],
         });
 
-        // Background sync turn log metadata
-        const walletClient = getWalletClient(writePrivateKey);
+        // Sync turn log metadata to Braga
         const logTxId = addLedgerTx({
           type: "create",
           entityType: "turn_log",
@@ -423,22 +496,32 @@ export const useGameStore = create<GameState>((set, get) => {
           details: `Syncing turn ${currentTurn} dice roll for ${activePlayer.name} to Arkiv Braga`,
         });
 
-        safeArkivWrite(
-          async () => {
-            return await walletClient.createEntity({
-              payload: jsonToPayload({ turn: currentTurn, player: activePlayer.id, dice: diceVal }),
-              contentType: "application/json",
-              attributes: [
-                PROJECT_ATTRIBUTE,
-                { key: "entityType", value: "turn_log" },
-                { key: "gameId", value: gameId },
-                { key: "turnNumber", value: currentTurn },
-              ],
-              expiresIn: ExpirationTime.fromHours(4),
-            });
-          },
-          (tx) => updateLedgerTxStatus(logTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-        ).catch(() => {});
+        try {
+          const walletClient = getWalletClient(writePrivateKey);
+          await safeArkivWrite(
+            async () => {
+              return await walletClient.createEntity({
+                payload: jsonToPayload({ turn: currentTurn, player: activePlayer.id, dice: diceVal }),
+                contentType: "application/json",
+                attributes: [
+                  PROJECT_ATTRIBUTE,
+                  { key: "entityType", value: "turn_log" },
+                  { key: "gameId", value: gameId },
+                  { key: "turnNumber", value: currentTurn },
+                ],
+                expiresIn: ExpirationTime.fromHours(4),
+              });
+            },
+            (tx) => updateLedgerTxStatus(logTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+          );
+        } catch (err: any) {
+          set({ 
+            isPlaying: false, 
+            activeAction: "idle", 
+            transactionError: err?.message || String(err) 
+          });
+          return; // abort step execution
+        }
 
         setTimeout(() => set({ activeAction: "moving" }), 400);
 
@@ -447,12 +530,10 @@ export const useGameStore = create<GameState>((set, get) => {
         const diceVal = get().diceResult || 1;
         const notebook = notebooks[activePlayer.id];
 
-        // AI strategy: identify all rooms not eliminated in its notebook
         const uneliminatedRooms = ROOMS.filter(
           (r) => r.id !== "MAINFRAME" && notebook.rooms[r.id] === "POSSIBLE"
         );
 
-        // Pathfind towards doors of these target rooms
         let bestTargetDoor: Position | null = null;
         let shortestPath: Position[] | null = null;
 
@@ -468,7 +549,6 @@ export const useGameStore = create<GameState>((set, get) => {
           }
         }
 
-        // If no rooms left or path blocked, pick any room or center Mainframe
         if (!shortestPath) {
           const centerMainframe = ROOMS.find((r) => r.id === "MAINFRAME")!;
           for (const door of centerMainframe.doors) {
@@ -486,10 +566,9 @@ export const useGameStore = create<GameState>((set, get) => {
         let arrivedRoom: RoomId | null = null;
 
         if (shortestPath && shortestPath.length > 1) {
-          // BFS path returns [start, step1, step2, ..., target]
           const movesPossible = Math.min(diceVal, shortestPath.length - 1);
           
-          // VISUAL WALK PATHING: Step coordinates tile-by-tile with delay
+          // VISUAL STEP ANIMATION: Pawn steps coordinate-by-coordinate with a short hop interval
           for (let i = 1; i <= movesPossible; i++) {
             const stepPos = shortestPath[i];
             set((state) => ({
@@ -502,7 +581,6 @@ export const useGameStore = create<GameState>((set, get) => {
 
           newPos = shortestPath[movesPossible];
 
-          // If we reached the door, enter the room center!
           if (newPos.x === bestTargetDoor?.x && newPos.y === bestTargetDoor?.y) {
             const targetRoom = getRoomAt(bestTargetDoor);
             if (targetRoom) {
@@ -512,7 +590,7 @@ export const useGameStore = create<GameState>((set, get) => {
             }
           }
         } else {
-          // Hallway default wiggle movement if totally trapped
+          // hallway wiggle
           const adjDirs = [
             { x: 0, y: -1 },
             { x: 0, y: 1 },
@@ -528,7 +606,7 @@ export const useGameStore = create<GameState>((set, get) => {
           }
         }
 
-        // Final coordinate position placement
+        // Apply final stepping coordinate
         const updatedPlayers = players.map((p) =>
           p.id === activePlayer.id
             ? { ...p, position: newPos, currentRoom: arrivedRoom }
@@ -553,54 +631,52 @@ export const useGameStore = create<GameState>((set, get) => {
           logs: [newLog, ...get().logs],
         });
 
-        // Check if suggestion can be made
         if (arrivedRoom) {
           set({ activeAction: "suggesting" });
         } else {
-          // Turn over if no room reached
           set({ activeAction: "next_turn_pending" });
           get().executeDeductionNotebooks();
         }
 
       } else if (activeAction === "suggesting") {
-        // --- STEP 3: CONCOCT SUGGESTION ---
+        // --- STEP 3: SUGGESTION DECLARATION ---
         const notebook = notebooks[activePlayer.id];
         const currentRoom = activePlayer.currentRoom!;
 
-        // AI strategy: Suggest suspect and weapon that are still POSSIBLE
-        const possibleSuspects = SUSPECTS.filter((s) => notebook.suspects[s.id] === "POSSIBLE");
-        const possibleWeapons = WEAPONS.filter((w) => notebook.weapons[w.id] === "POSSIBLE");
+        const possibleSuspect = SUSPECTS.filter((s) => notebook.suspects[s.id] === "POSSIBLE");
+        const possibleWeapon = WEAPONS.filter((w) => notebook.weapons[w.id] === "POSSIBLE");
 
-        const suggestedSuspect = possibleSuspects.length > 0 
-          ? possibleSuspects[Math.floor(Math.random() * possibleSuspects.length)].id 
+        const suggestedSuspect = possibleSuspect.length > 0 
+          ? possibleSuspect[Math.floor(Math.random() * possibleSuspect.length)].id 
           : SUSPECTS[Math.floor(Math.random() * SUSPECTS.length)].id;
 
-        const suggestedWeapon = possibleWeapons.length > 0 
-          ? possibleWeapons[Math.floor(Math.random() * possibleWeapons.length)].id 
+        const suggestedWeapon = possibleWeapon.length > 0 
+          ? possibleWeapon[Math.floor(Math.random() * possibleWeapon.length)].id 
           : WEAPONS[Math.floor(Math.random() * WEAPONS.length)].id;
 
         const roomConfig = ROOMS.find((r) => r.id === currentRoom)!;
 
-        // Teleport suggested suspect to this room
+        // Animate the suggested suspect "jumping" into the room center
         const updatedPlayers = players.map((p) =>
           p.id === suggestedSuspect
             ? { ...p, position: roomConfig.center, currentRoom: currentRoom }
             : p
         );
 
-        const suggestText = `${activePlayer.name} suspects ${
-          SUSPECTS.find((s) => s.id === suggestedSuspect)!.name
-        } inside the ${roomConfig.name} with a ${
-          WEAPONS.find((w) => w.id === suggestedWeapon)!.name
-        }!`;
+        const suspectName = SUSPECTS.find((s) => s.id === suggestedSuspect)!.name;
+        const weaponName = WEAPONS.find((w) => w.id === suggestedWeapon)!.name.replace("_", " ");
+        const roomName = roomConfig.name;
+
+        const suggestText = `${activePlayer.name} suspects ${suspectName} inside the ${roomName} with a ${weaponName}!`;
+        const newLogId = Date.now();
 
         const newLog: LogEntry = {
-          id: `suggest-log-${Date.now()}`,
+          id: `suggest-log-${newLogId}`,
           turn: currentTurn,
           player: activePlayer.id,
           type: "suggest",
           text: suggestText,
-          timestamp: Date.now(),
+          timestamp: newLogId,
         };
 
         set({
@@ -610,22 +686,31 @@ export const useGameStore = create<GameState>((set, get) => {
           activeAction: "disproving",
         });
 
+        const suggestContext = `Your name is ${activePlayer.name}. You are inside the ${roomName}. You are raising an active suggestion: you suspect that ${suspectName} committed the murder inside the ${roomName} using the ${weaponName}.`;
+
+        queryAgentInference(activePlayer.id, suggestContext, "SUGGESTION").then((speech) => {
+          const finalSpeech = speech ? `"${speech}" (${activePlayer.name} suspects ${suspectName} in ${roomName} with ${weaponName})` : suggestText;
+          set((state) => ({
+            logs: state.logs.map(log => 
+              log.id === `suggest-log-${newLogId}` ? { ...log, text: finalSpeech } : log
+            )
+          }));
+        });
+
       } else if (activeAction === "disproving") {
-        // --- STEP 4: CLOCKWISE DISPROVING LAYER ---
+        // --- STEP 4: CLOCKWISE REVEAL INQUIRY ---
         const suggestion = selectedSuggestion!;
         let disproved = false;
         let disprovingPlayerId: SuspectId | null = null;
         let cardShown: Card | null = null;
 
-        // Query players clockwise starting from the active player
         const activeIdx = players.findIndex((p) => p.id === activePlayer.id);
         
         for (let i = 1; i < players.length; i++) {
           const nextIdx = (activeIdx + i) % players.length;
-          const asker = players[nextIdx];
+          const responder = players[nextIdx];
 
-          // Check if asker holds any of the suggested cards
-          const matchingCards = asker.cards.filter(
+          const matchingCards = responder.cards.filter(
             (c) =>
               (c.type === "suspect" && c.id === suggestion.suspect) ||
               (c.type === "weapon" && c.id === suggestion.weapon) ||
@@ -634,22 +719,20 @@ export const useGameStore = create<GameState>((set, get) => {
 
           if (matchingCards.length > 0) {
             disproved = true;
-            disprovingPlayerId = asker.id;
+            disprovingPlayerId = responder.id;
 
-            // Heuristic card choice: pick the one that has been revealed the least to others
             const { notebookRevealCount } = get();
             matchingCards.sort((a, b) => {
-              const countA = notebookRevealCount[`${asker.id}-${a.id}`] || 0;
-              const countB = notebookRevealCount[`${asker.id}-${b.id}`] || 0;
+              const countA = notebookRevealCount[`${responder.id}-${a.id}`] || 0;
+              const countB = notebookRevealCount[`${responder.id}-${b.id}`] || 0;
               return countA - countB;
             });
             cardShown = matchingCards[0];
 
-            // Increment reveal counter
             set((state) => ({
               notebookRevealCount: {
                 ...state.notebookRevealCount,
-                [`${asker.id}-${cardShown!.id}`]: (state.notebookRevealCount[`${asker.id}-${cardShown!.id}`] || 0) + 1,
+                [`${responder.id}-${cardShown!.id}`]: (state.notebookRevealCount[`${responder.id}-${cardShown!.id}`] || 0) + 1,
               },
             }));
             break;
@@ -659,17 +742,29 @@ export const useGameStore = create<GameState>((set, get) => {
         if (disproved && disprovingPlayerId && cardShown) {
           const revealer = players.find((p) => p.id === disprovingPlayerId)!;
           const disprovedText = `${revealer.name} privately disproved ${activePlayer.name}'s suggestion.`;
+          const newLogId = Date.now();
 
           const newLog: LogEntry = {
-            id: `disprove-log-${Date.now()}`,
+            id: `disprove-log-${newLogId}`,
             turn: currentTurn,
             player: activePlayer.id,
             type: "disprove",
             text: disprovedText,
-            timestamp: Date.now(),
+            timestamp: newLogId,
           };
 
-          // Cryptographic Reveal via Arkiv Braga
+          const disproveContext = `Your name is ${revealer.name}. ${activePlayer.name} made a suggestion of suspect ${suggestion.suspect}, room ${suggestion.room}, and weapon ${suggestion.weapon}. You have successfully disproved this by privately sharing the ${cardShown.name} card with them.`;
+
+          queryAgentInference(revealer.id, disproveContext, "DISPROVAL").then((speech) => {
+            const finalSpeech = speech ? `"${speech}" (${revealer.name} privately disproved ${activePlayer.name}'s suggestion)` : disprovedText;
+            set((state) => ({
+              logs: state.logs.map(log => 
+                log.id === `disprove-log-${newLogId}` ? { ...log, text: finalSpeech } : log
+              )
+            }));
+          });
+
+          // Cryptographic Reveal via Braga
           const revealTxId = addLedgerTx({
             type: "create",
             entityType: "clue_share",
@@ -677,7 +772,6 @@ export const useGameStore = create<GameState>((set, get) => {
             details: `Encrypting & publishing clue reveal from ${revealer.name} to ${activePlayer.name} on Arkiv Braga`,
           });
 
-          // Structured high-entropy JSON package to prevent dict-attacks
           const randomRevealNonce = Math.random().toString(36).substring(2, 15);
           const revealPayload = JSON.stringify({
             card: cardShown.id,
@@ -686,38 +780,42 @@ export const useGameStore = create<GameState>((set, get) => {
             nonce: randomRevealNonce,
           });
 
-          // Encrypt shared card with recipient's public key (RSA-OAEP non-deterministic output)
-          const encryptedPayload = await encryptData(
-            revealPayload,
-            activePlayer.publicKey
-          );
+          try {
+            const encryptedPayload = await encryptData(revealPayload, activePlayer.publicKey);
+            const walletClient = getWalletClient(writePrivateKey);
 
-          const walletClient = getWalletClient(writePrivateKey);
+            // Await strict on-chain write
+            await safeArkivWrite(
+              async () => {
+                return await walletClient.createEntity({
+                  payload: jsonToPayload({ encryptedReveal: encryptedPayload }),
+                  contentType: "application/json",
+                  attributes: [
+                    PROJECT_ATTRIBUTE,
+                    { key: "entityType", value: "clue_share" },
+                    { key: "gameId", value: gameId },
+                    { key: "fromAgentId", value: revealer.id },
+                    { key: "toAgentId", value: activePlayer.id },
+                  ],
+                  expiresIn: ExpirationTime.fromHours(4),
+                });
+              },
+              (tx) => updateLedgerTxStatus(revealTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+            );
+          } catch (err: any) {
+            set({ 
+              isPlaying: false, 
+              activeAction: "idle", 
+              transactionError: err?.message || String(err) 
+            });
+            return;
+          }
 
-          safeArkivWrite(
-            async () => {
-              return await walletClient.createEntity({
-                payload: jsonToPayload({ encryptedReveal: encryptedPayload }),
-                contentType: "application/json",
-                attributes: [
-                  PROJECT_ATTRIBUTE,
-                  { key: "entityType", value: "clue_share" },
-                  { key: "gameId", value: gameId },
-                  { key: "fromAgentId", value: revealer.id },
-                  { key: "toAgentId", value: activePlayer.id },
-                ],
-                expiresIn: ExpirationTime.fromHours(4),
-              });
-            },
-            (tx) => updateLedgerTxStatus(revealTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-          ).catch(() => {});
-
-          // Decrypt card (in memory) and update notebook
+          // Decrypt and update locally
           set((state) => {
             const updatedNotebooks = { ...state.notebooks };
             const activeNotebook = updatedNotebooks[activePlayer.id];
 
-            // Update card status to ELIMINATED
             if (cardShown!.type === "suspect") {
               activeNotebook.suspects[cardShown!.id as SuspectId] = "ELIMINATED";
             } else if (cardShown!.type === "weapon") {
@@ -742,7 +840,6 @@ export const useGameStore = create<GameState>((set, get) => {
           });
 
         } else {
-          // Not disproved!
           const failText = `None of the other agents could disprove ${activePlayer.name}'s suggestion!`;
           const newLog: LogEntry = {
             id: `disprove-fail-${Date.now()}`,
@@ -765,12 +862,11 @@ export const useGameStore = create<GameState>((set, get) => {
         }
 
       } else if (activeAction === "accusing") {
-        // --- STEP 5: EVALUATE ACCUSATION LOGIC ---
+        // --- STEP 5: ACCUSATION HEURISTIC ---
         const notebook = notebooks[activePlayer.id];
         const solution = runNotebookDeduction(notebook);
         const { envelope } = get();
 
-        // An AI accuses only if it has fully eliminated suspects/weapons/rooms down to 1
         if (solution.solvedSuspect && solution.solvedWeapon && solution.solvedRoom && envelope) {
           const finalSuspect = SUSPECTS.find((s) => s.id === solution.solvedSuspect)!;
           const finalWeapon = WEAPONS.find((w) => w.id === solution.solvedWeapon)!;
@@ -781,7 +877,6 @@ export const useGameStore = create<GameState>((set, get) => {
             solution.solvedWeapon === envelope.weapon &&
             solution.solvedRoom === envelope.room;
 
-          // Accusation transaction
           const accuseTxId = addLedgerTx({
             type: "create",
             entityType: "accusation",
@@ -789,48 +884,57 @@ export const useGameStore = create<GameState>((set, get) => {
             details: `Publishing final Accusation by ${activePlayer.name} to Arkiv Braga`,
           });
 
-          const walletClient = getWalletClient(writePrivateKey);
+          try {
+            const walletClient = getWalletClient(writePrivateKey);
+            const randomAccNonce = Math.random().toString(36).substring(2, 15);
+            const accusationPayload = JSON.stringify({
+              card: `${solution.solvedSuspect}:${solution.solvedWeapon}:${solution.solvedRoom}`,
+              accuser: activePlayer.id,
+              correct: isCorrect,
+              nonce: randomAccNonce,
+              timestamp: Date.now(),
+            });
 
-          // Wrap accusation in entropy block
-          const randomAccNonce = Math.random().toString(36).substring(2, 15);
-          const accusationPayload = JSON.stringify({
-            card: `${solution.solvedSuspect}:${solution.solvedWeapon}:${solution.solvedRoom}`,
-            accuser: activePlayer.id,
-            correct: isCorrect,
-            nonce: randomAccNonce,
-            timestamp: Date.now(),
-          });
+            const encryptedAcc = await encryptData(accusationPayload, activePlayer.publicKey);
 
-          const encryptedAcc = await encryptData(accusationPayload, activePlayer.publicKey);
-
-          safeArkivWrite(
-            async () => {
-              return await walletClient.createEntity({
-                payload: jsonToPayload({ encryptedAcc, correct: isCorrect }),
-                contentType: "application/json",
-                attributes: [
-                  PROJECT_ATTRIBUTE,
-                  { key: "entityType", value: "accusation" },
-                  { key: "gameId", value: gameId },
-                  { key: "accuser", value: activePlayer.id },
-                  { key: "correct", value: isCorrect ? "true" : "false" },
-                ],
-                expiresIn: ExpirationTime.fromHours(4),
-              });
-            },
-            (tx) => updateLedgerTxStatus(accuseTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-          ).catch(() => {});
+            // Await strict on-chain write
+            await safeArkivWrite(
+              async () => {
+                return await walletClient.createEntity({
+                  payload: jsonToPayload({ encryptedAcc, correct: isCorrect }),
+                  contentType: "application/json",
+                  attributes: [
+                    PROJECT_ATTRIBUTE,
+                    { key: "entityType", value: "accusation" },
+                    { key: "gameId", value: gameId },
+                    { key: "accuser", value: activePlayer.id },
+                    { key: "correct", value: isCorrect ? "true" : "false" },
+                  ],
+                  expiresIn: ExpirationTime.fromHours(4),
+                });
+              },
+              (tx) => updateLedgerTxStatus(accuseTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+            );
+          } catch (err: any) {
+            set({ 
+              isPlaying: false, 
+              activeAction: "idle", 
+              transactionError: err?.message || String(err) 
+            });
+            return;
+          }
 
           if (isCorrect) {
-            // WINNER!
-            const winText = `🚨 DRAMATIC REVEAL! ${activePlayer.name} formally accuses ${finalSuspect.name} inside the ${finalRoom.name} using the ${finalWeapon.name}... AND IT IS CORRECT! ${activePlayer.name} has solved the Manor leak!`;
+            // WINNER
+            const winText = `🚨 CORRECT ACCUSATION! ${activePlayer.name} solved it! ${finalSuspect.name} in the ${finalRoom.name} with ${finalWeapon.name}!`;
+            const newLogId = Date.now();
             const winLog: LogEntry = {
-              id: `win-log-${Date.now()}`,
+              id: `win-log-${newLogId}`,
               turn: currentTurn,
               player: activePlayer.id,
               type: "accuse_success",
               text: winText,
-              timestamp: Date.now(),
+              timestamp: newLogId,
             };
 
             set({
@@ -841,7 +945,17 @@ export const useGameStore = create<GameState>((set, get) => {
               activeAction: "idle",
             });
 
-            // Update on-chain game session with finished status
+            const winContext = `Your name is ${activePlayer.name}. You have solved the murder! You are declaring a correct final accusation that ${finalSuspect.name} is the murderer, inside the ${finalRoom.name} using the ${finalWeapon.name}. You are announcing your victory.`;
+
+            queryAgentInference(activePlayer.id, winContext, "ACCUSATION").then((speech) => {
+              const finalSpeech = speech ? `🚨 CORRECT ACCUSATION! "${speech}" (${activePlayer.name} accused ${finalSuspect.name} in ${finalRoom.name} with ${finalWeapon.name})` : winText;
+              set((state) => ({
+                logs: state.logs.map(log => 
+                  log.id === `win-log-${newLogId}` ? { ...log, text: finalSpeech } : log
+                )
+              }));
+            });
+
             const finishSessionTxId = addLedgerTx({
               type: "update",
               entityType: "game_session",
@@ -849,31 +963,41 @@ export const useGameStore = create<GameState>((set, get) => {
               details: `Marking Game Session ${gameId} as finished on Arkiv`,
             });
 
-            safeArkivWrite(
-              async () => {
-                return await walletClient.createEntity({
-                  payload: jsonToPayload({
-                    gameId,
-                    status: "finished",
-                    winner: activePlayer.id,
-                    envelope,
-                  }),
-                  contentType: "application/json",
-                  attributes: [
-                    PROJECT_ATTRIBUTE,
-                    { key: "entityType", value: "game_session" },
-                    { key: "gameId", value: gameId },
-                    { key: "status", value: "finished" },
-                  ],
-                  expiresIn: ExpirationTime.fromHours(24),
-                });
-              },
-              (tx) => updateLedgerTxStatus(finishSessionTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-            ).catch(() => {});
+            try {
+              const walletClient = getWalletClient(writePrivateKey);
+              await safeArkivWrite(
+                async () => {
+                  return await walletClient.createEntity({
+                    payload: jsonToPayload({
+                      gameId,
+                      status: "finished",
+                      winner: activePlayer.id,
+                      envelope,
+                    }),
+                    contentType: "application/json",
+                    attributes: [
+                      PROJECT_ATTRIBUTE,
+                      { key: "entityType", value: "game_session" },
+                      { key: "gameId", value: gameId },
+                      { key: "status", value: "finished" },
+                    ],
+                    expiresIn: ExpirationTime.fromHours(24),
+                  });
+                },
+                (tx) => updateLedgerTxStatus(finishSessionTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+              );
+            } catch (err: any) {
+              set({ 
+                isPlaying: false, 
+                activeAction: "idle", 
+                transactionError: err?.message || String(err) 
+              });
+              return;
+            }
 
           } else {
-            // WRONG ACCUSATION - Eliminated
-            const failText = `❌ INCORRECT ACCUSATION! ${activePlayer.name} formally accused ${finalSuspect.name} in the ${finalRoom.name} with ${finalWeapon.name}... but the files inside the envelope do not match. ${activePlayer.name} is ELIMINATED!`;
+            // WRONG ACCUSATION
+            const failText = `❌ INCORRECT ACCUSATION! ${activePlayer.name} accused ${finalSuspect.name} in the ${finalRoom.name} with ${finalWeapon.name}... but the files do not match. ${activePlayer.name} is ELIMINATED!`;
             const failLog: LogEntry = {
               id: `fail-log-${Date.now()}`,
               turn: currentTurn,
@@ -894,7 +1018,6 @@ export const useGameStore = create<GameState>((set, get) => {
             });
           }
         } else {
-          // No accusation to make this turn, move to next player
           set({ activeAction: "next_turn_pending" });
         }
 
@@ -906,7 +1029,6 @@ export const useGameStore = create<GameState>((set, get) => {
           details: `Syncing encrypted detective notebook for ${activePlayer.name} to Arkiv Braga`,
         });
 
-        // Structured high-entropy JSON package
         const randomMemNonce = Math.random().toString(36).substring(2, 15);
         const notebookPayload = JSON.stringify({
           card: JSON.stringify(notebook),
@@ -915,34 +1037,40 @@ export const useGameStore = create<GameState>((set, get) => {
           nonce: randomMemNonce,
         });
 
-        const encryptedNotebook = await encryptData(
-          notebookPayload,
-          activePlayer.publicKey
-        );
+        try {
+          const encryptedNotebook = await encryptData(notebookPayload, activePlayer.publicKey);
+          const walletClient = getWalletClient(writePrivateKey);
 
-        const walletClient = getWalletClient(writePrivateKey);
-
-        safeArkivWrite(
-          async () => {
-            return await walletClient.createEntity({
-              payload: jsonToPayload({ encryptedNotebook }),
-              contentType: "application/json",
-              attributes: [
-                PROJECT_ATTRIBUTE,
-                { key: "entityType", value: "ai_memory" },
-                { key: "gameId", value: gameId },
-                { key: "agentId", value: activePlayer.id },
-              ],
-              expiresIn: ExpirationTime.fromHours(4),
-            });
-          },
-          (tx) => updateLedgerTxStatus(memoryTxId, tx.status, { txHash: tx.txHash, error: tx.error })
-        ).catch(() => {});
+          // Await strict on-chain write
+          await safeArkivWrite(
+            async () => {
+              return await walletClient.createEntity({
+                payload: jsonToPayload({ encryptedNotebook }),
+                contentType: "application/json",
+                attributes: [
+                  PROJECT_ATTRIBUTE,
+                  { key: "entityType", value: "ai_memory" },
+                  { key: "gameId", value: gameId },
+                  { key: "agentId", value: activePlayer.id },
+                ],
+                expiresIn: ExpirationTime.fromHours(4),
+              });
+            },
+            (tx) => updateLedgerTxStatus(memoryTxId, tx.status, { txHash: tx.txHash, error: tx.error })
+          );
+        } catch (err: any) {
+          set({ 
+            isPlaying: false, 
+            activeAction: "idle", 
+            transactionError: err?.message || String(err) 
+          });
+          return;
+        }
 
         get().executeDeductionNotebooks();
 
       } else if (activeAction === "next_turn_pending") {
-        // --- STEP 6: ADVANCE TO NEXT PLAYER ---
+        // --- STEP 6: ADVANCE SEQUENTIALLY TO NEXT ACTIVE PLAYER ---
         const nextIdx = (activePlayerIndex + 1) % players.length;
         const nextTurn = activeIdxToTurn(nextIdx, currentTurn, players.length);
 
@@ -958,16 +1086,12 @@ export const useGameStore = create<GameState>((set, get) => {
     },
 
     executeDeductionNotebooks: () => {
-      // Internal side-effect notebook elimination solvers
       const { players, notebooks } = get();
       
-      // Perform multi-agent cross-referencing deduction
       for (const p of players) {
         if (p.eliminated) continue;
-
         const notebook = notebooks[p.id];
         
-        // Count confirmed HELD_BY_OTHER/HELD_BY_ME cards
         const checkCategory = (items: any[], type: "suspects" | "weapons" | "rooms") => {
           const possibleItems = items.filter((item) => notebook[type][item.id] === "POSSIBLE");
           if (possibleItems.length === 1) {

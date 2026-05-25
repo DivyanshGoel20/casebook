@@ -6,11 +6,9 @@ import { BRAGA_CONFIG, getAddressFromPrivateKey } from "../lib/arkiv";
 import { 
   Database, 
   ExternalLink, 
-  Key, 
   CheckCircle2, 
   XCircle, 
   Loader2, 
-  Info,
   Layers,
   Copy,
   Check,
@@ -18,19 +16,10 @@ import {
 } from "lucide-react";
 
 export default function ArkivLedger() {
-  const { ledger, writePrivateKey, setWritePrivateKey } = useGameStore();
-  const [showConfig, setShowConfig] = useState(false);
-  const [inputKey, setInputKey] = useState(writePrivateKey);
+  const { ledger, writePrivateKey } = useGameStore();
   const [copied, setCopied] = useState(false);
 
   const HOST_PUBLIC_ADDRESS = getAddressFromPrivateKey(writePrivateKey);
-
-  const handleSaveKey = () => {
-    if (inputKey.trim()) {
-      setWritePrivateKey(inputKey.trim());
-      setShowConfig(false);
-    }
-  };
 
   const handleCopy = () => {
     navigator.clipboard.writeText(HOST_PUBLIC_ADDRESS);
@@ -49,14 +38,6 @@ export default function ArkivLedger() {
           <Database className="w-4 h-4 text-cyan-400 shadow-[0_0_8px_rgba(6,182,212,0.4)] animate-pulse" />
           Arkiv Braga Ledger
         </h3>
-
-        <button
-          onClick={() => setShowConfig(!showConfig)}
-          className="px-2.5 py-1 text-[9px] font-bold font-mono uppercase bg-zinc-900 hover:bg-zinc-800 text-zinc-400 hover:text-cyan-400 rounded-lg border border-zinc-800/80 hover:border-cyan-500/30 flex items-center gap-1.5 transition-all duration-300"
-        >
-          <Key className="w-3 h-3" />
-          Settings
-        </button>
       </div>
 
       {/* GAS FUNDING INSTRUCTION CARD - Highly prominent */}
@@ -112,34 +93,6 @@ export default function ArkivLedger() {
           <div className="leading-normal">
             <span className="font-bold block uppercase">Insufficient Gas Warning!</span>
             Deployments are failing. Please send test GLM to the host address listed above to resume writes.
-          </div>
-        </div>
-      )}
-
-      {/* Private Key Config Overlay */}
-      {showConfig && (
-        <div className="p-3.5 bg-zinc-950 border border-zinc-800/80 rounded-2xl mb-4 text-xs font-mono">
-          <h4 className="font-bold text-zinc-200 mb-1 flex items-center gap-1">
-            <Key className="w-3.5 h-3.5 text-cyan-400" />
-            Wallet Private Key Override
-          </h4>
-          <p className="text-[9px] text-zinc-500 mb-3 leading-relaxed">
-            By default, we run using the host demo key. Paste your own Braga private key below to run operations using your funded developer wallet.
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="password"
-              value={inputKey}
-              onChange={(e) => setInputKey(e.target.value)}
-              placeholder="0x..."
-              className="flex-1 bg-zinc-900 border border-zinc-800 p-2 text-[9px] rounded focus:outline-none focus:border-cyan-500 text-zinc-300 font-mono"
-            />
-            <button
-              onClick={handleSaveKey}
-              className="bg-cyan-600 hover:bg-cyan-500 text-zinc-950 font-bold px-3 py-1.5 rounded transition-all text-[10px]"
-            >
-              SAVE
-            </button>
           </div>
         </div>
       )}
@@ -211,12 +164,6 @@ export default function ArkivLedger() {
             </div>
           ))
         )}
-      </div>
-
-      {/* Testnet Specs footer */}
-      <div className="mt-4 border-t border-zinc-850 pt-3 flex justify-between items-center text-[8px] text-zinc-600 font-mono">
-        <span>Braga RPC: braga.hoodi.arkiv.network</span>
-        <span>ChainID: 60138453102</span>
       </div>
     </div>
   );

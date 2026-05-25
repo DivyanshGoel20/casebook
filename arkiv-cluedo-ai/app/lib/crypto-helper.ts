@@ -4,9 +4,12 @@
  * Encrypts payloads of any size by combining symmetric AES-GCM with asymmetric RSA-OAEP.
  */
 
-// Helper to convert ArrayBuffer to Base64
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const binary = String.fromCharCode(...new Uint8Array(buffer));
+// Helper to convert ArrayBuffer or ArrayBufferView to Base64
+function arrayBufferToBase64(buffer: ArrayBuffer | ArrayBufferView): string {
+  const uint8 = buffer instanceof ArrayBuffer 
+    ? new Uint8Array(buffer) 
+    : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const binary = String.fromCharCode(...uint8);
   return typeof btoa !== "undefined" ? btoa(binary) : Buffer.from(binary, "binary").toString("base64");
 }
 

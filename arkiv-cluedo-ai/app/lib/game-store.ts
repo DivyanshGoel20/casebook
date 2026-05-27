@@ -38,6 +38,7 @@ import {
   safeArkivWrite,
 } from "./arkiv";
 import { ExpirationTime, jsonToPayload } from "@arkiv-network/sdk/utils";
+import { eq } from "@arkiv-network/sdk/query";
 
 const queryAgentInference = async (
   agentId: string,
@@ -98,11 +99,12 @@ interface GameState {
   setGameSpeed: (speed: number) => void;
   togglePlay: () => void;
   addLedgerTx: (tx: Omit<ArkivTx, "id" | "timestamp">) => string;
-  updateLedgerTxStatus: (id: string, status: "success" | "error", update: Partial<ArkivTx>) => void;
+  updateLedgerTxStatus: (id: string, status: "pending" | "success" | "error", update: Partial<ArkivTx>) => void;
   resetGame: () => void;
   initializeGame: () => Promise<void>;
   executeSingleStep: () => Promise<void>;
   clearTransactionError: () => void;
+  executeDeductionNotebooks: () => void;
 }
 
 export const useGameStore = create<GameState>((set, get) => {
@@ -198,6 +200,19 @@ export const useGameStore = create<GameState>((set, get) => {
       set({ activeAction: "idle", status: "setup", transactionError: null });
 
       const generatedGameId = `game-${Math.random().toString(36).substring(2, 10)}`;
+
+      // Query check: Retrieve recent game sessions under our PROJECT_ATTRIBUTE
+      try {
+        const queryResult = await publicClient
+          .buildQuery()
+          .where(eq("project", PROJECT_ATTRIBUTE.value))
+          .where(eq("entityType", "game_session"))
+          .limit(5)
+          .fetch();
+        console.log("Recent active game sessions queried from Braga:", queryResult.entities);
+      } catch (queryErr) {
+        console.warn("Failed to query past game sessions from Braga:", queryErr);
+      }
 
       // 1. Generate cryptographic keys for AI agents
       const agentKeys: Record<SuspectId, { publicKey: string; privateKey: any }> = {} as any;
@@ -942,10 +957,11 @@ export const useGameStore = create<GameState>((set, get) => {
             const suggestion = state.selectedSuggestion!;
 
             const checkAndSolve = (cardId: string, type: "suspects" | "weapons" | "rooms", list: any[]) => {
-              if (activeNotebook[type][cardId as any] !== "HELD_BY_ME") {
+              const categoryRecord = activeNotebook[type] as Record<string, NotebookStatus>;
+              if (categoryRecord[cardId] !== "HELD_BY_ME") {
                 for (const item of list) {
                   if (item.id !== cardId) {
-                    activeNotebook[type][item.id as any] = "ELIMINATED";
+                    categoryRecord[item.id] = "ELIMINATED";
                   }
                 }
               }
@@ -1210,9 +1226,10 @@ export const useGameStore = create<GameState>((set, get) => {
         const notebook = notebooks[p.id];
         
         const checkCategory = (items: any[], type: "suspects" | "weapons" | "rooms") => {
-          const possibleItems = items.filter((item) => notebook[type][item.id] === "POSSIBLE");
+          const categoryRecord = notebook[type] as Record<string, NotebookStatus>;
+          const possibleItems = items.filter((item) => categoryRecord[item.id] === "POSSIBLE");
           if (possibleItems.length === 1) {
-            notebook[type][possibleItems[0].id] = "POSSIBLE";
+            categoryRecord[possibleItems[0].id] = "POSSIBLE";
           }
         };
 
